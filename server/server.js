@@ -589,6 +589,7 @@ wss.on('connection', (clientWs) => {
   let currentAbortController = null;
   let sessionPersona = PERSONAS.ava; // active persona for this session
   let lastInterimText = '';   // Last non-empty INTERIM text — used as fallback on abnormal STT close
+  let autoProcessTimer = null; // Fires every 20 s to flush accumulated speech without waiting for FINAL
 
   console.log('[VoiceSession] Browser connected');
 
@@ -878,6 +879,17 @@ wss.on('connection', (clientWs) => {
       console.log('[VoiceSession] Cartesia Ink STT connected');
       sessionState = 'streaming';
       sendClient({ type: 'ready', provider: 'cartesia' });
+
+      // Every 20 s, push whatever interim speech has accumulated to the LLM
+      // instead of waiting for Cartesia to detect end-of-utterance.
+      autoProcessTimer = setInterval(() => {
+        if (lastInterimText && !isProcessing) {
+          console.log('[VoiceSession] 20s auto-flush — processing:', lastInterimText);
+          pendingTranscripts.push(lastInterimText);
+          lastInterimText = '';
+          processNextTranscript();
+        }
+      }, 20000);
     });
 
     sttWs.on('message', (data) => {
@@ -930,6 +942,8 @@ wss.on('connection', (clientWs) => {
 
     sttWs.on('close', (code, reason) => {
       console.log('[VoiceSession] Cartesia STT closed:', code, reason?.toString() || '');
+      clearInterval(autoProcessTimer);
+      autoProcessTimer = null;
       // On abnormal close (e.g. 1009 message-too-large), recover by processing
       // the last interim transcript so the model still speaks back.
       if (code !== 1000 && code !== 1001 && lastInterimText && !isProcessing) {
@@ -953,6 +967,7 @@ wss.on('connection', (clientWs) => {
     isProcessing = false;
     pendingTranscripts = [];
     lastInterimText = '';
+    if (autoProcessTimer) { clearInterval(autoProcessTimer); autoProcessTimer = null; }
     if (currentAbortController) {
       currentAbortController.abort();
       currentAbortController = null;
