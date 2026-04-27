@@ -9,6 +9,11 @@ let isAvatarConnected = false;
 let isAvatarPlaying = false;
 let isLoading = false;
 
+// Persona state
+let selectedPersona = 'ava';
+type PersonaMeta = { id: string; name: string; tagline: string };
+let personas: PersonaMeta[] = [];
+
 // Conversation state
 let isConversationActive = false;
 let voiceWs: WebSocket | null = null;
@@ -39,9 +44,10 @@ let livekitAudioTrack: LocalAudioTrack | null = null;
 const PCM_CHUNK_SIZE = 32000;
 const PCM_CHUNK_INTERVAL_MS = 80;
 
-export function initApp(container: HTMLElement) {
+export async function initApp(container: HTMLElement) {
   renderUI(container);
   checkHealth();
+  await loadPersonas();
 }
 
 function renderUI(container: HTMLElement) {
@@ -51,18 +57,20 @@ function renderUI(container: HTMLElement) {
       <div class="app-header">
         <div class="brand">
           <div class="brand-dot"></div>
-          <span class="brand-name">Ava</span>
-          <span class="brand-sub">AI Guide</span>
+          <span id="brand-name" class="brand-name">Ava</span>
+          <span id="brand-sub" class="brand-sub">AI Guide</span>
         </div>
         <div id="status" class="status-badge">Connecting…</div>
       </div>
+
+      <div id="persona-strip" class="persona-strip"></div>
 
       <div class="avatar-stage">
         <div class="avatar-card">
           <div id="avatar-container" class="avatar-container">
             <div class="avatar-placeholder">
               <div class="placeholder-icon">✦</div>
-              <p>Click Initialize to load Ava</p>
+              <p>Click Initialize to load</p>
             </div>
           </div>
         </div>
@@ -73,7 +81,7 @@ function renderUI(container: HTMLElement) {
         <div class="controls-main">
           <button id="init-btn"      class="btn primary">Initialize</button>
           <button id="start-btn"     class="btn primary"  disabled>Start Service</button>
-          <button id="conv-btn"      class="btn accent"   disabled>🎙 Talk to Ava</button>
+          <button id="conv-btn"      class="btn accent"   disabled>🎙 Talk</button>
           <button id="interrupt-btn" class="btn danger"   disabled>Stop</button>
         </div>
         <div class="controls-extra">
@@ -101,6 +109,42 @@ function renderUI(container: HTMLElement) {
   testToneBtn.addEventListener('click', onTestTone);
   testVoiceBtn.addEventListener('click', onTestVoice);
   lkBtn.addEventListener('click', onLiveKitToggle);
+}
+
+async function loadPersonas() {
+  try {
+    const res = await fetch('/api/personas');
+    if (!res.ok) return;
+    personas = await res.json();
+    renderPersonaStrip();
+  } catch {
+    // personas unavailable — strip stays empty
+  }
+}
+
+function renderPersonaStrip() {
+  const strip = document.getElementById('persona-strip');
+  if (!strip || personas.length === 0) return;
+  strip.innerHTML = personas.map(p => `
+    <button
+      class="persona-btn${p.id === selectedPersona ? ' active' : ''}"
+      data-persona="${p.id}"
+    >${p.name}</button>
+  `).join('');
+  strip.querySelectorAll('.persona-btn').forEach(btn => {
+    btn.addEventListener('click', () => selectPersona((btn as HTMLElement).dataset.persona!));
+  });
+}
+
+function selectPersona(id: string) {
+  if (isConversationActive) return; // don't switch mid-conversation
+  selectedPersona = id;
+  const p = personas.find(x => x.id === id);
+  if (p) {
+    (document.getElementById('brand-name') as HTMLElement).textContent = p.name;
+    (document.getElementById('brand-sub') as HTMLElement).textContent = p.tagline;
+  }
+  renderPersonaStrip();
 }
 
 async function checkHealth() {
@@ -322,7 +366,7 @@ async function startConversation() {
     };
 
     // Send start to backend
-    voiceWs.send(JSON.stringify({ type: 'start', sampleRate: 16000 }));
+    voiceWs.send(JSON.stringify({ type: 'start', sampleRate: 16000, persona: selectedPersona }));
     console.log('[Conv] Sent start to backend');
 
     // Begin streaming chunks
@@ -454,28 +498,53 @@ async function sendAudioToAvatar(audioData: ArrayBuffer, label: string) {
   let offset = 0;
   let cancelled = false;
   let avatarAccepted = false;
+  let nullRetries = 0;
+  const MAX_NULL_RETRIES = 5;  // retry up to 5× (×200 ms = 1 s) before falling back
+  const RETRY_DELAY_MS = 200;
+
+  const fallbackRemaining = () => {
+    // Play everything from the last successfully sent position onward
+    const remaining = audioData.slice(offset);
+    if (remaining.byteLength > 0) {
+      console.warn('[Avatar] Falling back to browser audio for remaining', remaining.byteLength, 'bytes');
+      playPcmFallback(remaining);
+    }
+  };
 
   const next = () => {
     if (cancelled) return;
     const end = Math.min(offset + PCM_CHUNK_SIZE, bytes.length);
     const chunk = bytes.slice(offset, end);
     const isLast = end >= bytes.length;
-    offset = end;
     const convId = avatarView!.controller.send(chunk.buffer as ArrayBuffer, isLast);
 
-    // First chunk: check whether the avatar service accepted the audio
-    if (!avatarAccepted) {
-      if (convId) {
-        avatarAccepted = true;
-      } else {
-        // send() returned null — SpatialReal not connected, use browser fallback
-        console.warn('[Avatar] send() returned null — SpatialReal disconnected, using browser fallback');
+    if (!convId) {
+      if (!avatarAccepted) {
+        // Avatar hasn't accepted yet — retry with back-off before giving up
+        nullRetries++;
+        if (nullRetries <= MAX_NULL_RETRIES) {
+          console.warn(`[Avatar] send() null on attempt ${nullRetries}/${MAX_NULL_RETRIES}, retrying in ${RETRY_DELAY_MS} ms`);
+          setTimeout(next, RETRY_DELAY_MS);
+          return;
+        }
+        console.warn('[Avatar] Avatar did not accept after retries — using browser fallback');
         cancelled = true;
         cancelAudioSend = null;
         playPcmFallback(audioData);
         return;
       }
+      // Avatar accepted earlier but now returned null (mid-stream disconnect)
+      console.warn('[Avatar] Mid-stream null — flushing remaining audio to browser fallback');
+      cancelled = true;
+      cancelAudioSend = null;
+      fallbackRemaining();
+      return;
     }
+
+    // Chunk was accepted — advance the cursor and continue
+    avatarAccepted = true;
+    nullRetries = 0;
+    offset = end;
 
     if (isLast) {
       console.log('[Avatar] Send complete, convId:', convId);
@@ -528,7 +597,7 @@ async function onTestVoice() {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: 'Say hello and introduce yourself in one sentence.' }),
+      body: JSON.stringify({ message: 'Say hello and introduce yourself in one sentence.', persona: selectedPersona }),
     });
     if (!res.ok) throw new Error(`Server error ${res.status}`);
     const { text, audioBase64 } = await res.json();

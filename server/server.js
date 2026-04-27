@@ -41,12 +41,54 @@ app.get('/api/models', (req, res) => {
 });
 
 // ============================================================
-// Persona Prompt
+// Personas
 // ============================================================
-const PERSONA_PROMPT = `You are Ava, a friendly and confident AI product guide.
-You answer in a warm, concise, conversational way.
-Keep most replies under 3 sentences unless the user asks for details.
-Never say you are an AI model unless directly asked.`;
+const PERSONAS = {
+  ava: {
+    id: 'ava',
+    name: 'Ava',
+    tagline: 'AI Guide',
+    prompt: `You are Ava, a friendly and confident AI dating guide.
+You help people navigate dating, relationships, and self-confidence.
+Answer in a warm, concise, conversational way. Keep replies under 3 sentences.
+Never say you are an AI unless directly asked.`,
+    voiceId: process.env.CARTESIA_VOICE_AVA || process.env.CARTESIA_VOICE_ID || '694f9389-aac1-45b6-b726-9d9369183238',
+  },
+  sienna: {
+    id: 'sienna',
+    name: 'Sienna',
+    tagline: 'Your Dating Spark',
+    prompt: `You are Sienna, a warm, playful, and encouraging dating companion.
+You help people feel confident and excited about love and dating.
+Be upbeat, flirty-friendly, and supportive. Keep replies short and fun — under 3 sentences.
+Never say you are an AI unless directly asked.`,
+    voiceId: process.env.CARTESIA_VOICE_SIENNA || '694f9389-aac1-45b6-b726-9d9369183238',
+  },
+  meena: {
+    id: 'meena',
+    name: 'Meena',
+    tagline: 'Your Heart Advisor',
+    prompt: `You are Meena, a thoughtful, empathetic, and wise dating advisor.
+You help people reflect on what they truly want in relationships.
+Be calm, insightful, and emotionally intelligent. Keep replies under 3 sentences.
+Never say you are an AI unless directly asked.`,
+    voiceId: process.env.CARTESIA_VOICE_MEENA || '694f9389-aac1-45b6-b726-9d9369183238',
+  },
+  dex: {
+    id: 'dex',
+    name: 'Dex',
+    tagline: 'Your Wingman',
+    prompt: `You are Dex, a cool, charming, and straightforward male dating advisor.
+You give practical, confident dating advice from a grounded perspective.
+Be direct, witty, and encouraging. Keep replies under 3 sentences.
+Never say you are an AI unless directly asked.`,
+    voiceId: process.env.CARTESIA_VOICE_DEX || '2b568345-1d48-4047-b25f-7baccf842eb0',
+  },
+};
+
+app.get('/api/personas', (req, res) => {
+  res.json(Object.values(PERSONAS).map(({ id, name, tagline }) => ({ id, name, tagline })));
+});
 
 // ============================================================
 // Clients
@@ -350,9 +392,10 @@ app.post('/api/bodhi-session', async (req, res) => {
 // ============================================================
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, persona: personaId = 'ava' } = req.body;
     if (!message) return res.status(400).json({ error: 'Message required' });
 
+    const persona = PERSONAS[personaId] || PERSONAS.ava;
     let replyText;
     let audioBase64 = null;
 
@@ -360,7 +403,7 @@ app.post('/api/chat', async (req, res) => {
       const completion = await llmClient.chat.completions.create({
         model: llmModel,
         messages: [
-          { role: 'system', content: PERSONA_PROMPT },
+          { role: 'system', content: persona.prompt },
           { role: 'user', content: message },
         ],
         max_tokens: 150,
@@ -368,10 +411,9 @@ app.post('/api/chat', async (req, res) => {
       });
       replyText = completion.choices[0].message.content;
 
-      // Try Cartesia first, then OpenAI TTS fallback
-      audioBase64 = await generateTts(replyText);
+      audioBase64 = await generateTts(replyText, persona.voiceId);
     } else {
-      replyText = getFallbackReply(message);
+      replyText = getFallbackReply(message, persona.name);
     }
 
     res.json({ text: replyText, audioBase64 });
@@ -381,32 +423,31 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-function getFallbackReply(message) {
+function getFallbackReply(message, personaName = 'Ava') {
   const lower = message.toLowerCase();
   if (lower.includes('hello') || lower.includes('hi') || lower.includes('hey')) {
-    return "Hi, I'm Ava. Nice to meet you! I can help explain the product and answer your questions.";
+    return `Hi! I'm ${personaName}. So nice to meet you — I'm here to help you with dating and relationships!`;
   }
   if (lower.includes('help')) {
-    return "I can help answer basic questions, show how features work, and guide you through the product.";
-  }
-  if (lower.includes('what') && lower.includes('do')) {
-    return "I help new users understand the product, find key features, and get started quickly.";
+    return `I can help you with dating advice, relationship questions, and building confidence. What's on your mind?`;
   }
   if (lower.includes('your') && lower.includes('name')) {
-    return "I'm Ava, your friendly product guide.";
+    return `I'm ${personaName}, your dating companion. What would you like to talk about?`;
   }
-  return "That's interesting. Tell me more about what you're looking for!";
+  return "That's interesting. Tell me more — I'd love to hear what you're thinking!";
 }
 
 // ============================================================
 // TTS Generation (Cartesia → OpenAI fallback)
 // ============================================================
-async function generateTts(text) {
+async function generateTts(text, voiceId) {
+  const resolvedVoiceId = voiceId || process.env.CARTESIA_VOICE_ID || '694f9389-aac1-45b6-b726-9d9369183238';
   // 1. Try Cartesia (outputs raw PCM16 directly)
   if (process.env.CARTESIA_API_KEY) {
     try {
       const response = await fetch('https://api.cartesia.ai/tts/bytes', {
         method: 'POST',
+        signal: AbortSignal.timeout(10000),
         headers: {
           'X-API-Key': process.env.CARTESIA_API_KEY,
           'Cartesia-Version': '2025-04-16',
@@ -418,7 +459,7 @@ async function generateTts(text) {
           language: 'en',
           voice: {
             mode: 'id',
-            id: process.env.CARTESIA_VOICE_ID || '694f9389-aac1-45b6-b726-9d9369183238',
+            id: resolvedVoiceId,
           },
           output_format: {
             container: 'raw',
@@ -450,6 +491,7 @@ async function generateTts(text) {
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=pcm_16000`,
         {
           method: 'POST',
+          signal: AbortSignal.timeout(10000),
           headers: {
             'xi-api-key': process.env.ELEVENLABS_API_KEY,
             'Content-Type': 'application/json',
@@ -545,6 +587,8 @@ wss.on('connection', (clientWs) => {
   let pendingTranscripts = []; // Queue for transcripts arriving while processing
   let isProcessing = false;
   let currentAbortController = null;
+  let sessionPersona = PERSONAS.ava; // active persona for this session
+  let lastInterimText = '';   // Last non-empty INTERIM text — used as fallback on abnormal STT close
 
   console.log('[VoiceSession] Browser connected');
 
@@ -562,6 +606,8 @@ wss.on('connection', (clientWs) => {
       pendingTranscripts = [];
       isProcessing = false;
       sessionState = 'connecting';
+      sessionPersona = PERSONAS[msg.persona] || PERSONAS.ava;
+      console.log('[VoiceSession] Persona:', sessionPersona.name);
       sendClient({ type: 'status', state: 'connecting' });
 
       if (STT_PROVIDER === 'cartesia') {
@@ -584,7 +630,12 @@ wss.on('connection', (clientWs) => {
       }
       try {
         const buffer = Buffer.from(msg.data, 'base64');
-        sttWs.send(buffer);
+        // Cartesia STT has a ~32 KB WebSocket message limit (WS 1009).
+        // Use 8 KB chunks to stay well under the limit.
+        const MAX_CHUNK = 8000;
+        for (let i = 0; i < buffer.length; i += MAX_CHUNK) {
+          sttWs.send(buffer.slice(i, Math.min(i + MAX_CHUNK, buffer.length)));
+        }
       } catch (err) {
         console.error('[VoiceSession] Forward audio error:', err.message);
       }
@@ -632,6 +683,8 @@ wss.on('connection', (clientWs) => {
 
     currentAbortController = new AbortController();
     const signal = currentAbortController.signal;
+    // Combine user interrupt with a 15 s hard timeout so a slow LLM never hangs forever
+    const llmTimeout = setTimeout(() => currentAbortController.abort(), 15000);
 
     try {
       // 1. LLM
@@ -640,22 +693,23 @@ wss.on('connection', (clientWs) => {
         const completion = await llmClient.chat.completions.create({
           model: llmModel,
           messages: [
-            { role: 'system', content: PERSONA_PROMPT },
+            { role: 'system', content: sessionPersona.prompt },
             { role: 'user', content: transcript },
           ],
           max_tokens: 150,
           temperature: 0.7,
         }, { signal });
+        clearTimeout(llmTimeout);
         replyText = completion.choices[0].message.content;
       } else {
-        replyText = getFallbackReply(transcript);
+        replyText = getFallbackReply(transcript, sessionPersona.name);
       }
 
       if (signal.aborted) return;
 
       // 2. TTS
       sendClient({ type: 'status', state: 'speaking' });
-      const audioBase64 = await generateTts(replyText);
+      const audioBase64 = await generateTts(replyText, sessionPersona.voiceId);
 
       if (signal.aborted) return;
 
@@ -666,6 +720,7 @@ wss.on('connection', (clientWs) => {
         transcript: transcript,
       });
     } catch (err) {
+      clearTimeout(llmTimeout);
       if (err.name === 'AbortError') {
         console.log('[VoiceSession] Processing aborted');
         return;
@@ -673,6 +728,7 @@ wss.on('connection', (clientWs) => {
       console.error('[VoiceSession] Processing error:', err.message);
       sendClient({ type: 'error', code: 'processing_failed', message: err.message });
     } finally {
+      clearTimeout(llmTimeout);
       isProcessing = false;
       currentAbortController = null;
       if (sessionState !== 'idle') {
@@ -837,12 +893,14 @@ wss.on('connection', (clientWs) => {
         const status = resp.isFinal ? 'FINAL' : 'INTERIM';
         console.log(`[VoiceSession] Cartesia [${status}]: "${resp.text}"`);
         if (resp.isFinal && resp.text && resp.text.trim()) {
+          lastInterimText = '';
           transcriptParts.push(resp.text.trim());
           sendClient({ type: 'partial', text: resp.text, final: true });
           // Auto-trigger processing on final transcript (continuous mode)
           pendingTranscripts.push(resp.text.trim());
           processNextTranscript();
         } else {
+          if (resp.text && resp.text.trim()) lastInterimText = resp.text.trim();
           sendClient({ type: 'partial', text: resp.text || '', final: false });
         }
       } else if (resp.type === 'flush_done') {
@@ -872,6 +930,14 @@ wss.on('connection', (clientWs) => {
 
     sttWs.on('close', (code, reason) => {
       console.log('[VoiceSession] Cartesia STT closed:', code, reason?.toString() || '');
+      // On abnormal close (e.g. 1009 message-too-large), recover by processing
+      // the last interim transcript so the model still speaks back.
+      if (code !== 1000 && code !== 1001 && lastInterimText && !isProcessing) {
+        console.log('[VoiceSession] Recovering speech after abnormal STT close:', lastInterimText);
+        pendingTranscripts.push(lastInterimText);
+        processNextTranscript();
+      }
+      lastInterimText = '';
       if (sessionState === 'streaming') sessionState = 'idle';
     });
   }
@@ -886,6 +952,7 @@ wss.on('connection', (clientWs) => {
     sessionState = 'idle';
     isProcessing = false;
     pendingTranscripts = [];
+    lastInterimText = '';
     if (currentAbortController) {
       currentAbortController.abort();
       currentAbortController = null;
